@@ -10,6 +10,7 @@ import ResetPassword from "@/pages/ResetPassword";
 import Home from "@/pages/Home";
 import Marketplace from "@/pages/Marketplace";
 import AddItem from "@/pages/AddItem";
+import EditItem from "@/pages/EditItem";
 import ItemDetail from "@/pages/ItemDetail";
 import Messages from "@/pages/Messages";
 import Notifications from "@/pages/Notifications";
@@ -34,6 +35,7 @@ const App = () => (
               <Route path="/marketplace" element={<Marketplace />} />
               <Route path="/add-item" element={<AddItem />} />
               <Route path="/items/:id" element={<ItemDetail />} />
+              <Route path="/items/:id/edit" element={<EditItem />} />
               <Route path="/messages" element={<Messages />} />
               <Route path="/notifications" element={<Notifications />} />
               <Route path="/history" element={<History />} />

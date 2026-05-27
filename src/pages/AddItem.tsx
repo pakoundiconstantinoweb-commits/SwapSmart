@@ -1,6 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { z } from "zod";
 import { Upload, Loader2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
@@ -12,15 +11,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
 import { ITEM_CATEGORIES, ITEM_CONDITIONS, type ItemCategory, type ItemCondition } from "@/lib/itemMeta";
-
-const schema = z.object({
-  title: z.string().trim().min(2).max(100),
-  description: z.string().max(1000).optional(),
-  points: z.number().int().min(0).max(100000),
-  location: z.string().max(100).optional(),
-  category: z.enum(ITEM_CATEGORIES),
-  condition: z.enum(ITEM_CONDITIONS),
-});
+import { itemFormSchema } from "@/lib/itemFormSchema";
+import { uploadItemImage } from "@/lib/itemStorage";
 
 export default function AddItem() {
   const { user } = useAuth();
@@ -33,10 +25,16 @@ export default function AddItem() {
     title: "",
     description: "",
     points: 50,
-    location: profile?.location ?? "",
+    location: "",
     category: "Autre" as ItemCategory,
     condition: "Bon état" as ItemCondition,
   });
+
+  useEffect(() => {
+    if (profile?.location && !form.location) {
+      setForm((f) => ({ ...f, location: profile.location ?? "" }));
+    }
+  }, [profile?.location]);
 
   const handleFile = (f: File | null) => {
     if (!f) return;
@@ -48,7 +46,7 @@ export default function AddItem() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user) return;
-    const parsed = schema.safeParse({
+    const parsed = itemFormSchema.safeParse({
       title: form.title,
       description: form.description || undefined,
       points: Number(form.points),
@@ -64,11 +62,7 @@ export default function AddItem() {
     try {
       let image_url: string | null = null;
       if (file) {
-        const ext = file.name.split(".").pop();
-        const path = `${user.id}/${Date.now()}.${ext}`;
-        const { error: upErr } = await supabase.storage.from("item-images").upload(path, file);
-        if (upErr) throw upErr;
-        image_url = supabase.storage.from("item-images").getPublicUrl(path).data.publicUrl;
+        image_url = await uploadItemImage(user.id, file);
       }
       const { error } = await supabase.from("items").insert({
         user_id: user.id,

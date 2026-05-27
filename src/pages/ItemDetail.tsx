@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, MapPin, ImageOff, Send, Trash2 } from "lucide-react";
+import { ArrowLeft, MapPin, ImageOff, Send, Trash2, Pencil } from "lucide-react";
 import { format } from "date-fns";
 import { fr } from "date-fns/locale";
 import { supabase } from "@/integrations/supabase/client";
@@ -13,6 +13,8 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { toast } from "sonner";
+import { deleteItemImage } from "@/lib/itemStorage";
+import { fetchProfilesByIds } from "@/lib/profiles";
 
 export default function ItemDetail() {
   const { id } = useParams<{ id: string }>();
@@ -22,19 +24,38 @@ export default function ItemDetail() {
   const qc = useQueryClient();
   const [message, setMessage] = useState("");
   const [requesting, setRequesting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [open, setOpen] = useState(false);
 
   const { data: item, isLoading } = useQuery({
     queryKey: ["item", id],
     enabled: !!id,
     queryFn: async () => {
+      const { data, error } = await supabase.from("items").select("*").eq("id", id!).maybeSingle();
+      if (error) throw error;
+      if (!data) return null;
+
+      const profiles = await fetchProfilesByIds([data.user_id]);
+      return {
+        ...data,
+        owner: profiles.get(data.user_id) ?? null,
+      };
+    },
+  });
+
+  const { data: myPendingRequest } = useQuery({
+    queryKey: ["my-pending-swap", id, user?.id],
+    enabled: !!id && !!user?.id && !!item && item.user_id !== user.id,
+    queryFn: async () => {
       const { data, error } = await supabase
-        .from("items")
-        .select("*, profiles!items_user_id_fkey(username, avatar_url, location)")
-        .eq("id", id!)
+        .from("swap_requests")
+        .select("id")
+        .eq("item_id", id!)
+        .eq("buyer_id", user!.id)
+        .eq("status", "pending")
         .maybeSingle();
       if (error) throw error;
-      return data as any;
+      return data;
     },
   });
 
@@ -42,7 +63,12 @@ export default function ItemDetail() {
   if (!item) return <div className="p-10">Objet introuvable.</div>;
 
   const isOwner = user?.id === item.user_id;
-  const owner = item.profiles;
+  const owner = item.owner;
+  const canRequest =
+    !isOwner &&
+    item.status === "available" &&
+    !myPendingRequest &&
+    !!user;
 
   const handleRequest = async () => {
     if (!user) return;
@@ -50,7 +76,27 @@ export default function ItemDetail() {
       toast.error("Tu n’as pas assez de points");
       return;
     }
+    if (item.status !== "available") {
+      toast.error("Cet objet n’est plus disponible");
+      return;
+    }
+
     setRequesting(true);
+
+    const { data: existing } = await supabase
+      .from("swap_requests")
+      .select("id")
+      .eq("item_id", item.id)
+      .eq("buyer_id", user.id)
+      .eq("status", "pending")
+      .maybeSingle();
+
+    if (existing) {
+      setRequesting(false);
+      toast.error("Tu as déjà une demande en attente pour cet objet");
+      return;
+    }
+
     const { error } = await supabase.from("swap_requests").insert({
       item_id: item.id,
       buyer_id: user.id,
@@ -58,36 +104,82 @@ export default function ItemDetail() {
       points: item.points,
       message: message || null,
     });
-    if (!error && message) {
-      await supabase.from("messages").insert({
+
+    if (error) {
+      setRequesting(false);
+      toast.error(error.message);
+      return;
+    }
+
+    await supabase
+      .from("items")
+      .update({ status: "pending" })
+      .eq("id", item.id)
+      .eq("status", "available");
+
+    if (message.trim()) {
+      const { error: msgErr } = await supabase.from("messages").insert({
         sender_id: user.id,
         receiver_id: item.user_id,
-        content: `[Demande d’échange pour "${item.title}"] ${message}`,
+        content: `[Demande d’échange pour "${item.title}"] ${message.trim()}`,
       });
+      if (msgErr) {
+        toast.warning("Demande envoyée, mais le message n’a pas pu être livré");
+      }
     }
+
     setRequesting(false);
-    if (error) toast.error(error.message);
-    else {
-      toast.success("Demande envoyée !");
-      setOpen(false);
-      setMessage("");
-    }
+    toast.success("Demande envoyée !");
+    setOpen(false);
+    setMessage("");
+    qc.invalidateQueries({ queryKey: ["item", id] });
+    qc.invalidateQueries({ queryKey: ["my-pending-swap", id, user.id] });
+    qc.invalidateQueries({ queryKey: ["incoming-requests"] });
+    qc.invalidateQueries({ queryKey: ["marketplace-items"] });
   };
 
   const handleDelete = async () => {
-    if (!confirm("Supprimer cet objet ?")) return;
-    const { error } = await supabase.from("items").delete().eq("id", item.id);
-    if (error) toast.error(error.message);
-    else {
+    if (!user || !confirm("Supprimer cet objet ? Cette action est irréversible.")) return;
+
+    const { count, error: countErr } = await supabase
+      .from("swap_requests")
+      .select("*", { count: "exact", head: true })
+      .eq("item_id", item.id)
+      .eq("status", "pending");
+
+    if (countErr) {
+      toast.error(countErr.message);
+      return;
+    }
+    if ((count ?? 0) > 0) {
+      toast.error("Impossible de supprimer : une demande d’échange est en cours");
+      return;
+    }
+
+    setDeleting(true);
+    try {
+      await deleteItemImage(item.image_url);
+      const { error } = await supabase.from("items").delete().eq("id", item.id).eq("user_id", user.id);
+      if (error) throw error;
       toast.success("Objet supprimé");
-      qc.invalidateQueries();
+      qc.invalidateQueries({ queryKey: ["marketplace-items"] });
+      qc.invalidateQueries({ queryKey: ["my-items"] });
       navigate("/marketplace");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Impossible de supprimer l’objet";
+      toast.error(msg);
+    } finally {
+      setDeleting(false);
     }
   };
 
   return (
     <div className="p-6 md:p-10 max-w-5xl mx-auto">
-      <button onClick={() => navigate(-1)} className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 text-sm mb-6">
+      <button
+        type="button"
+        onClick={() => navigate(-1)}
+        className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 text-sm mb-6"
+      >
         <ArrowLeft className="h-4 w-4" /> Retour
       </button>
 
@@ -116,15 +208,22 @@ export default function ItemDetail() {
                 <MapPin className="h-4 w-4" /> {item.location}
               </p>
             )}
-            <p className="text-xs text-muted-foreground mt-1">Publié le {format(new Date(item.created_at), "d MMMM yyyy", { locale: fr })}</p>
+            <p className="text-xs text-muted-foreground mt-1">
+              Publié le {format(new Date(item.created_at), "d MMMM yyyy", { locale: fr })}
+            </p>
           </div>
 
           {item.description && <p className="text-foreground/80 whitespace-pre-wrap">{item.description}</p>}
 
-          <Link to={`/messages?with=${item.user_id}`} className="flex items-center gap-3 p-3 bg-muted/40 rounded-xl hover:bg-muted transition">
+          <Link
+            to={`/messages?with=${item.user_id}`}
+            className="flex items-center gap-3 p-3 bg-muted/40 rounded-xl hover:bg-muted transition"
+          >
             <Avatar>
               {owner?.avatar_url && <AvatarImage src={owner.avatar_url} />}
-              <AvatarFallback className="bg-primary text-primary-foreground">{owner?.username?.[0]?.toUpperCase() ?? "?"}</AvatarFallback>
+              <AvatarFallback className="bg-primary text-primary-foreground">
+                {owner?.username?.[0]?.toUpperCase() ?? "?"}
+              </AvatarFallback>
             </Avatar>
             <div>
               <p className="font-medium">{owner?.username ?? "Utilisateur"}</p>
@@ -133,13 +232,32 @@ export default function ItemDetail() {
           </Link>
 
           {isOwner ? (
-            <Button variant="destructive" onClick={handleDelete} className="w-full h-11">
-              <Trash2 className="h-4 w-4 mr-2" /> Supprimer l’objet
+            <div className="flex flex-col gap-2">
+              {item.status !== "swapped" && (
+                <Button variant="outline" className="w-full h-11" asChild>
+                  <Link to={`/items/${item.id}/edit`}>
+                    <Pencil className="h-4 w-4 mr-2" /> Modifier l’objet
+                  </Link>
+                </Button>
+              )}
+              <Button
+                variant="destructive"
+                onClick={handleDelete}
+                disabled={deleting}
+                className="w-full h-11"
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                {deleting ? "Suppression..." : "Supprimer l’objet"}
+              </Button>
+            </div>
+          ) : myPendingRequest ? (
+            <Button disabled className="w-full h-11">
+              Demande en attente
             </Button>
-          ) : item.status === "available" ? (
+          ) : canRequest ? (
             <Dialog open={open} onOpenChange={setOpen}>
               <DialogTrigger asChild>
-                <Button className="w-full h-11" disabled={!user}>
+                <Button className="w-full h-11">
                   <Send className="h-4 w-4 mr-2" /> Demander l’échange ({item.points} pts)
                 </Button>
               </DialogTrigger>
@@ -148,8 +266,8 @@ export default function ItemDetail() {
                   <DialogTitle>Demander l’échange</DialogTitle>
                 </DialogHeader>
                 <p className="text-sm text-muted-foreground">
-                  Tu enverras au propriétaire de {item.title} une demande d’échange pour <strong>{item.points} points</strong>.
-                  Il pourra accepter ou refuser.
+                  Tu enverras au propriétaire de {item.title} une demande d’échange pour{" "}
+                  <strong>{item.points} points</strong>. Il pourra accepter ou refuser.
                 </p>
                 <Textarea
                   placeholder="Ajouter un message (facultatif)"
@@ -158,7 +276,9 @@ export default function ItemDetail() {
                   maxLength={500}
                 />
                 <DialogFooter>
-                  <Button variant="outline" onClick={() => setOpen(false)}>Annuler</Button>
+                  <Button variant="outline" onClick={() => setOpen(false)}>
+                    Annuler
+                  </Button>
                   <Button onClick={handleRequest} disabled={requesting}>
                     {requesting ? "Envoi..." : "Envoyer la demande"}
                   </Button>
@@ -166,7 +286,9 @@ export default function ItemDetail() {
               </DialogContent>
             </Dialog>
           ) : (
-            <Button disabled className="w-full h-11">Objet déjà échangé</Button>
+            <Button disabled className="w-full h-11">
+              Objet non disponible
+            </Button>
           )}
         </div>
       </div>

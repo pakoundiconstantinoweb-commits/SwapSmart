@@ -41,10 +41,13 @@ Ouvre http://localhost:8080
 
 Le déploiement est automatique à chaque push sur `main` (workflow `.github/workflows/deploy.yml`).
 
-### 1. Activer GitHub Pages
+### 1. Activer GitHub Pages (obligatoire)
 
-1. Repo → **Settings** → **Pages**
-2. **Build and deployment** → Source : **GitHub Actions**
+1. Ouvre : https://github.com/pakoundiconstantinoweb-commits/SwapSmart/settings/pages
+2. **Build and deployment** → **Source** : **Deploy from a branch**
+3. **Branch** : `gh-pages` — dossier **`/ (root)`**
+4. Clique **Save**
+5. Attends 1 à 2 minutes, puis ouvre le site (lien ci-dessus)
 
 ### 2. Secrets obligatoires (Settings → Secrets and variables → Actions)
 
